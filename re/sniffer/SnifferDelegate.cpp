@@ -49,7 +49,7 @@ void SnifferDelegate::paint(QPainter *painter, const QStyleOptionViewItem &optio
         return;
     }
 
-    if (index.column() > 10) return;
+    if (index.column() - 3 >= SNIFFER_MAX_DATA_BYTES) return; //can't be a data byte column
 
     int x;
     SnifferItem *item = static_cast<SnifferItem*>(index.internalPointer());

@@ -48,6 +48,13 @@ SnifferWindow::SnifferWindow(QWidget *parent) :
     connect(ui->btAll, &QPushButton::clicked, this, &SnifferWindow::fltAll);
     connect(ui->btNone, &QPushButton::clicked, this, &SnifferWindow::fltNone);
     connect(&mModel, &SnifferModel::idChange, this, &SnifferWindow::idChange);
+    //the model adds data columns when CAN-FD frames longer than the current column count show up
+    connect(&mModel, &QAbstractItemModel::columnsInserted, this,
+            [this](const QModelIndex &, int first, int last)
+            {
+                for (int i = first; i <= last; i++) ui->treeView->setColumnWidth(i, 92);
+                ui->treeView->setColumnWidth(mModel.columnCount() - 1, 1); //trailing spacer column
+            });
     connect(ui->listWidget, &QListWidget::itemChanged, this, &SnifferWindow::itemChanged);
 
     connect(ui->cbFadeInactive, &QCheckBox::stateChanged, this, [this](int val){mModel.setFadeInactive(val);sniffDel->setFadeInactive(val);});

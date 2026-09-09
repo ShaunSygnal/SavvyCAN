@@ -77,6 +77,7 @@ CANFrameModel::CANFrameModel(QObject *parent)
     interpretFrames = false;
     overwriteDups = false;
     filtersPersistDuringClear = false;
+    ignoreDBCColors = false;
     useHexMode = true;
     useColorsByCanId = false;
     timeStyle = TS_MICROS;

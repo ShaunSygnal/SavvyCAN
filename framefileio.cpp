@@ -2034,11 +2034,11 @@ bool FrameFileIO::isNativeCSVFile(QString filename)
                 {
                     if (fileVersion == 1)
                     {
-                        if (tokens[4].toUInt() > 8) isMatch = false;
+                        if (tokens[4].toUInt() > 64) isMatch = false; //CAN-FD frames may carry up to 64 bytes
                     }
                     else if (fileVersion == 2)
                     {
-                        if ( tokens[5].toUInt() > 8) isMatch = false;
+                        if ( tokens[5].toUInt() > 64) isMatch = false;
                     }
                 }
                 else isMatch = false;
@@ -2118,7 +2118,7 @@ bool FrameFileIO::loadNativeCSVFile(QString filename, QVector<CANFrame>* frames)
                     thisFrame.isReceived = true;
                     thisFrame.bus = tokens[3].toInt();
                     int lng = tokens[4].toInt();
-                    if (lng > 8) lng = 8;
+                    if (lng > 64) lng = 64; //CAN-FD frames may carry up to 64 bytes
                     if (lng < 0) lng = 0;
                     if (lng + 5 > tokens.length()) lng = tokens.length() - 5;
                     QByteArray bytes(lng, 0);
@@ -2133,7 +2133,7 @@ bool FrameFileIO::loadNativeCSVFile(QString filename, QVector<CANFrame>* frames)
                     else thisFrame.isReceived = false;
                     thisFrame.bus = tokens[4].toInt();                    
                     int lng = tokens[5].toInt();
-                    if (lng > 8) lng = 8;
+                    if (lng > 64) lng = 64; //CAN-FD frames may carry up to 64 bytes
                     if (lng < 0) lng = 0;
                     if (lng + 6 > tokens.length()) lng = tokens.length() - 6;
                     QByteArray bytes(lng, 0);
@@ -2202,7 +2202,7 @@ bool FrameFileIO::saveNativeCSVFile(QString filename, const QVector<CANFrame>* f
         outFile->write(QString::number(dataLen).toUtf8());
         outFile->putChar(44);
 
-        for (int temp = 0; temp < 8; temp++)
+        for (int temp = 0; temp < qMax(8, dataLen); temp++) //always at least the classic 8 columns, more for CAN-FD
         {
             if (temp < dataLen)
                 outFile->write(QString::number(data[temp], 16).toUpper().rightJustified(2, '0').toUtf8());
@@ -2294,7 +2294,7 @@ bool FrameFileIO::writeContinuousNative(const QVector<CANFrame>* frames, int beg
         continuousFile.write(QString::number(dataLen).toUtf8());
         continuousFile.putChar(44);
 
-        for (int temp = 0; temp < 8; temp++)
+        for (int temp = 0; temp < qMax(8, dataLen); temp++) //always at least the classic 8 columns, more for CAN-FD
         {
             if (temp < dataLen)
                 continuousFile.write(QString::number(data[temp], 16).toUpper().rightJustified(2, '0').toUtf8());

@@ -4,6 +4,8 @@
 #include <QDialog>
 #include <QDebug>
 #include <QTreeWidget>
+#include <array>
+#include <vector>
 #include "framefileio.h"
 #include "can_structs.h"
 #include "utility.h"
@@ -13,13 +15,35 @@ namespace Ui {
 class FileComparatorWindow;
 }
 
+//Per-ID statistics gathered over a set of frames. Sized for anything up to a full 64 byte CAN-FD payload.
 struct FrameData
 {
-    uint32_t ID;
-    int dataLen;
-    uint64_t bitmap;
-    int values[8][256]; //first index is the data byte, second is # of times we saw that value
+    static constexpr int maxDataBytes = 64;
+
+    uint32_t ID = 0;
+    int dataLen = 0; //longest payload seen for this ID
+    std::array<uint8_t, maxDataBytes> bitmap{}; //per data byte, which bits were ever set
+    std::vector<std::array<int, 256>> values; //values[byte][value] = # of times we saw that value in that byte
     QHash<QString, QList<QString>> signalInstances;
+
+    void ensureLength(int len)
+    {
+        if (len > static_cast<int>(values.size())) values.resize(len, std::array<int, 256>{});
+        if (len > dataLen) dataLen = len;
+    }
+
+    int valueCount(int byte, int value) const
+    {
+        if (byte < 0 || byte >= static_cast<int>(values.size())) return 0;
+        return values[byte][value & 0xFF];
+    }
+
+    bool bitSet(int bit) const
+    {
+        int byte = bit / 8;
+        if (bit < 0 || byte >= maxDataBytes) return false;
+        return (bitmap[byte] & (1 << (bit % 8))) != 0;
+    }
 };
 
 class FileComparatorWindow : public QDialog

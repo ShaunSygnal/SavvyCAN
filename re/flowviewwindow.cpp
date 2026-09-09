@@ -30,6 +30,7 @@ FlowViewWindow::FlowViewWindow(const QVector<CANFrame> *frames, QWidget *parent)
     memset(currBytes, 0, 64);
     memset(triggerValues, -1, sizeof(int) * 8);
     for (int i = 0; i < 8; i++) triggerBits[i] = 0;
+    for (int i = 0; i < 64; i++) graphRef[i] = nullptr;
 
     //ui->graphView->setInteractions();
 
@@ -336,12 +337,12 @@ void FlowViewWindow::gotCenterTimeID(uint32_t ID, double timestamp)
         currentPosition = bestIdx;
         if (ui->cbAutoRef->isChecked())
         {
-            memcpy(refBytes, currBytes, 8);
+            memcpy(refBytes, currBytes, 64);
         }
 
-        memset(currBytes, 0, 8); //first zero out all 8 bytes
+        memset(currBytes, 0, 64); //first zero out the whole buffer (CAN-FD frames can use all 64 bytes)
 
-        memcpy(currBytes, frameCache.at(currentPosition).payload().data(), frameCache.at(currentPosition).payload().length());
+        memcpy(currBytes, frameCache.at(currentPosition).payload().constData(), qMin(frameCache.at(currentPosition).payload().length(), 64));
 
         updateDataView();
     }
@@ -443,8 +444,8 @@ void FlowViewWindow::saveFileFlow()
 
 void FlowViewWindow::updatedFrames(int numFrames)
 {
-    QVector<double>newX[8];
-    QVector<double>newY[8];
+    QVector<double>newX[64];
+    QVector<double>newY[64];
     const unsigned char *data;
     int dataLen = 0;
 
@@ -485,7 +486,7 @@ void FlowViewWindow::updatedFrames(int numFrames)
         {
             thisFrame = &modelFrames->at(i);
             data = reinterpret_cast<const unsigned char *>(thisFrame->payload().constData());
-            dataLen = thisFrame->payload().length();
+            dataLen = qMin(thisFrame->payload().length(), 64);
 
             if (!foundID.contains(thisFrame->frameId()))
             {
@@ -518,11 +519,11 @@ void FlowViewWindow::updatedFrames(int numFrames)
                 }
             }
         }
-        if (ui->cbLiveMode->checkState() == Qt::Checked)
+        if (ui->cbLiveMode->checkState() == Qt::Checked && frameCache.count() > 0) //cache is empty right after the frames were cleared
         {
             currentPosition = frameCache.count() - 1;
             memset(currBytes, 0, 64);
-            memcpy(currBytes, frameCache.at(currentPosition).payload().data(), frameCache.at(currentPosition).payload().length());
+            memcpy(currBytes, frameCache.at(currentPosition).payload().constData(), qMin(frameCache.at(currentPosition).payload().length(), 64));
             memcpy(refBytes, currBytes, 64);
 
         }
@@ -543,7 +544,8 @@ void FlowViewWindow::updatedFrames(int numFrames)
 
 void FlowViewWindow::removeAllGraphs()
 {
-  ui->graphView->clearGraphs();
+  ui->graphView->clearGraphs(); //this deletes the graph objects so drop our references to them too
+  for (int i = 0; i < 64; i++) graphRef[i] = nullptr;
   ui->graphView->replot();
 }
 
@@ -599,7 +601,7 @@ void FlowViewWindow::createGraph(int byteNum)
     ui->graphView->graph()->setData(x[byteNum],y[byteNum]);
     ui->graphView->graph()->setLineStyle(QCPGraph::lsLine); //connect points with lines
     QPen graphPen;
-    graphPen.setColor(graphColors[byteNum]);
+    graphPen.setColor(graphColors[byteNum % 8]);
     graphPen.setWidth(1);
     ui->graphView->graph()->setPen(graphPen);
     ui->graphView->axisRect()->setupFullAxesBox();
@@ -655,8 +657,8 @@ void FlowViewWindow::changeID(QString newID)
     if (frameCache.count() == 0) return;
 
     removeAllGraphs();
-    //for (uint32_t c = 0; c < frameCache.at(0).len; c++)
-    for (uint32_t c = 0; c < 8; c++)
+    //one graph per data byte actually present in this ID's frames (up to the CAN-FD maximum of 64)
+    for (int c = 0; c < qMin(maxBytes, 64); c++)
     {
         createGraph(c);
     }
@@ -664,7 +666,7 @@ void FlowViewWindow::changeID(QString newID)
     updateGraphLocation();
 
     memset(currBytes, 0, 64);
-    memcpy(currBytes, frameCache.at(currentPosition).payload().constData(), frameCache.at(currentPosition).payload().length());
+    memcpy(currBytes, frameCache.at(currentPosition).payload().constData(), qMin(frameCache.at(currentPosition).payload().length(), 64));
     memcpy(refBytes, currBytes, 64);
 
     updateDataView();
@@ -712,7 +714,7 @@ void FlowViewWindow::btnStopClick()
     currentPosition = 0;
 
     memset(currBytes, 0, 64);
-    memcpy(currBytes, frameCache.at(currentPosition).payload().constData(), frameCache.at(currentPosition).payload().length());
+    memcpy(currBytes, frameCache.at(currentPosition).payload().constData(), qMin(frameCache.at(currentPosition).payload().length(), 64));
     memcpy(refBytes, currBytes, 64);
 
     updateFrameLabel();
@@ -844,12 +846,13 @@ void FlowViewWindow::updatePosition(bool forward)
     //get through that then they're changed and a trigger so we stop playback at this frame.
     //This is complicated by the fact that CAN-FD frames might have far more than 64 bits. It is necessary
     //to thus process them 64 bits at a time and just move chunk to chunk until done.
-    for (int chunk = 0; chunk < frameCache.at(currentPosition).payload().length(); chunk += 8)
+    int payloadLen = qMin(frameCache.at(currentPosition).payload().length(), 64);
+    for (int chunk = 0; chunk < payloadLen; chunk += 8) //chunk is the first byte of each 8 byte (64 bit) group
     {
         uint64_t changedBits = 0;
         uint8_t cngByte;
-        int maxVal = qMin(chunk * 8 + 8, frameCache.at(currentPosition).payload().length());
-        for (int i = chunk * 8; i < maxVal; i++)
+        int maxVal = qMin(chunk + 8, payloadLen);
+        for (int i = chunk; i < maxVal; i++)
         {
             unsigned char thisByte = static_cast<unsigned char>(frameCache.at(currentPosition).payload()[i]);
             cngByte = currBytes[i] ^ thisByte;
@@ -867,7 +870,7 @@ void FlowViewWindow::updatePosition(bool forward)
         }
     }
     memset(currBytes, 0, 64);
-    memcpy(currBytes, frameCache.at(currentPosition).payload().constData(), frameCache.at(currentPosition).payload().length());
+    memcpy(currBytes, frameCache.at(currentPosition).payload().constData(), qMin(frameCache.at(currentPosition).payload().length(), 64));
 
     if (ui->cbSync->checkState() == Qt::Checked) emit sendCenterTimeID(frameCache[currentPosition].frameId(), frameCache[currentPosition].timeStamp().microSeconds() / 1000000.0);
     ui->timelineSlider->setValue(currentPosition);

@@ -5,10 +5,13 @@
 #include <QElapsedTimer>
 #include "can_structs.h"
 
+//Largest payload a CAN-FD frame can carry. Classic CAN frames only ever use the first 8 entries.
+static constexpr int SNIFFER_MAX_DATA_BYTES = 64;
+
 struct fstCan
 {
-    quint8 data[8];
-    quint32 dataTimestamp[8];
+    quint8 data[SNIFFER_MAX_DATA_BYTES];
+    quint32 dataTimestamp[SNIFFER_MAX_DATA_BYTES];
     int len;
 };
 
@@ -45,7 +48,7 @@ private:
     struct fstCan   mCurrent;
     struct fstCan   mLastMarker;
     struct fstCan   mMarker;
-    quint8          mNotch[8];
+    quint8          mNotch[SNIFFER_MAX_DATA_BYTES];
     quint64         mLastTime;
     quint64         mCurrentTime;
     quint64         mCurrSeqVal;

@@ -68,6 +68,7 @@ private:
     bool                        mDarkMode;
     quint32                     mTimeSequence;
     quint32                     mExpireInterval;
+    int                         mDataColumns; //number of data byte columns currently shown (8 for classic CAN, grows for CAN-FD)
 };
 
 #endif // SNIFFERMODEL_H

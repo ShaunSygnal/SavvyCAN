@@ -156,38 +156,41 @@ void ISOTP_HANDLER::processFrame(const CANFrame &frame)
     int frameType;
     int frameLen;
     int ln;
-    //int offset;
     ISOTP_MESSAGE msg;
     ISOTP_MESSAGE *pMsg;
     QByteArray dataBytes;
     const unsigned char *data = reinterpret_cast<const unsigned char *>(frame.payload().constData());
-    //qDebug() << frame.payload().count();
-    //int dataLen = frame.payload().count();
+    const int dataLen = frame.payload().count();
+    //with extended addressing the first byte is the target address and the PCI byte follows it
+    const int pci = useExtendedAddressing ? 1 : 0;
 
-    frameType = 0;
-    frameLen = 0;
+    if (dataLen < pci + 1) return; //no PCI byte present, nothing we can do with this frame
 
     if (useExtendedAddressing)
     {
         ID = ID << 8;
         ID += data[0];
-        frameType = data[1] >> 4;
-        frameLen = data[1] & 0xF;
     }
-    else
-    {
-        frameType = data[0] >> 4;
-        frameLen = data[0] & 0xF;
-    }
+    frameType = data[pci] >> 4;
+    frameLen = data[pci] & 0xF;
 
     switch(frameType)
     {
     case 0: //single frame message
+    {
         checkNeedFlush(ID);
 
-        if (frameLen == 0) return; //length of zero isn't valid.
-        if (frameLen > 6 && useExtendedAddressing) return; //impossible
-        if (frameLen > 7) return;
+        int dataStart = pci + 1;
+        if (frameLen == 0)
+        {
+            //ISO 15765-2:2016 CAN-FD escape sequence: a zero length nibble means the real length is in the next byte
+            if (dataLen <= 8 || dataLen < pci + 2) return; //only valid on CAN-FD frames longer than 8 bytes
+            frameLen = data[pci + 1];
+            dataStart = pci + 2;
+        }
+        else if (frameLen > 7 - pci) return; //impossible for classic CAN framing
+
+        if (frameLen > dataLen - dataStart) return; //claims more data than the frame actually carries
 
         msg.bus = frame.bus;
         msg.setFrameType(QCanBusFrame::FrameType::DataFrame);
@@ -198,52 +201,38 @@ void ISOTP_HANDLER::processFrame(const CANFrame &frame)
         msg.reportedLength = frameLen;
         msg.setTimeStamp(frame.timeStamp());
         msg.isMultiframe = false;
-        if (useExtendedAddressing)
-        {       
-            for (int j = 0; j < frameLen; j++)
-            {
-                if (frame.payload().count() > (j+2))
-                    dataBytes.append(data[j+2]);
-            }
-        }
-        else
-        {
-            for (int j = 0; j < frameLen; j++)
-            {
-                if (frame.payload().count() > (j+1))
-                    dataBytes.append(data[j+1]);
-            }
-        }
+        for (int j = 0; j < frameLen; j++) dataBytes.append(data[dataStart + j]);
         qDebug() << "Emitting single frame ISOTP message";
         msg.setPayload(dataBytes);
         emit newISOMessage(msg);
         break;
+    }
     case 1: //first frame of a multi-frame message
+    {
         checkNeedFlush(ID);
+        if (dataLen < 8) return; //MUST have all 8 data bytes in this first frame.
         msg.bus = frame.bus;
-        if (frame.payload().count() < 8) return; //MUST have all 8 data bytes in this first frame.
         msg.setExtendedFrameFormat( frame.hasExtendedFrameFormat() );
         msg.setFrameId(ID);
         msg.setTimeStamp(frame.timeStamp());
         msg.isReceived = frame.isReceived;
         msg.isMultiframe = true;
-        frameLen = frameLen << 8;
-        if (useExtendedAddressing)
+
+        int dataStart = pci + 2;
+        qint64 totalLen = (frameLen << 8) + data[pci + 1]; //12 bit length
+        if (totalLen == 0)
         {
-            frameLen += data[2];
-            frameLen = frameLen & 0xFFF;
-            dataBytes.reserve(frameLen);
-            msg.reportedLength = frameLen;
-            for (int j = 0; j < 5; j++) dataBytes.append(frame.payload()[3 + j]);
+            //ISO 15765-2:2016 CAN-FD escape sequence: a zero 12 bit length means a 32 bit length follows
+            if (dataLen < pci + 6) return;
+            totalLen = (static_cast<qint64>(data[pci + 2]) << 24) | (data[pci + 3] << 16) | (data[pci + 4] << 8) | data[pci + 5];
+            dataStart = pci + 6;
         }
-        else
-        {
-            frameLen += data[1];
-            frameLen = frameLen & 0xFFF;
-            msg.payload().reserve(frameLen);
-            msg.reportedLength = frameLen;
-            for (int j = 0; j < 6; j++) dataBytes.append(frame.payload()[2 + j]);
-        }
+        if (totalLen <= 0 || totalLen > 0x7FFFFFFF) return;
+        msg.reportedLength = static_cast<int>(totalLen);
+        dataBytes.reserve(qMin(msg.reportedLength, 4096));
+        //every byte after the PCI/length header is message data. Classic CAN gives 6 (5 with extended addressing), CAN-FD gives more.
+        int toCopy = qMin(dataLen - dataStart, msg.reportedLength);
+        for (int j = 0; j < toCopy; j++) dataBytes.append(data[dataStart + j]);
         msg.lastSequence = -1;
         msg.setPayload(dataBytes);
         messageBuffer.insert(msg.frameId(), msg);
@@ -263,6 +252,7 @@ void ISOTP_HANDLER::processFrame(const CANFrame &frame)
             CANConManager::getInstance()->sendFrame(outFrame);
         }
         break;
+    }
     case 2: //subsequent frames for multi-frame messages
         pMsg = nullptr;
         if (messageBuffer.contains(ID))
@@ -274,17 +264,9 @@ void ISOTP_HANDLER::processFrame(const CANFrame &frame)
         dataBytes.clear();
         dataBytes.append(pMsg->payload());
         ln = pMsg->reportedLength - pMsg->payload().count();
-        //offset = pMsg->data.count();
-        if (useExtendedAddressing)
-        {
-            if (ln > 6) ln = 6;
-            for (int j = 0; j < ln; j++) dataBytes.append(frame.payload()[j+2]);
-        }
-        else
-        {
-            if (ln > 7) ln = 7;
-            for (int j = 0; j < ln; j++) dataBytes.append(frame.payload()[j+1]);
-        }
+        //a consecutive frame carries everything after its PCI byte: 7 bytes on classic CAN (6 with extended addressing), up to 63 on CAN-FD
+        if (ln > dataLen - (pci + 1)) ln = dataLen - (pci + 1);
+        for (int j = 0; j < ln; j++) dataBytes.append(data[pci + 1 + j]);
         pMsg->setPayload(dataBytes);
         if (pMsg->reportedLength <= pMsg->payload().count())
         {
@@ -297,11 +279,12 @@ void ISOTP_HANDLER::processFrame(const CANFrame &frame)
         {
         case 0: //continue to send frames but maybe change inter-frame delay
             waitingForFlow = false;
-            //data[1] contains number of frames to send before waiting for next flow control
-            framesUntilFlow = data[1];
+            if (dataLen < pci + 3) break; //block size and separation time bytes are missing
+            //next byte contains number of frames to send before waiting for next flow control
+            framesUntilFlow = data[pci + 1];
             if (framesUntilFlow == 0) framesUntilFlow = -1; //-1 means don't count frames and just keep going
-            //data[2] contains the interframe delay to use (0xF1 through 0xF9 are special through - 100 to 900us)
-            if (data[2] < 0xF1) frameTimer.start(data[2]); //set proper delay between frames
+            //then the interframe delay to use (0xF1 through 0xF9 are special through - 100 to 900us)
+            if (data[pci + 2] < 0xF1) frameTimer.start(data[pci + 2]); //set proper delay between frames
             else frameTimer.start(1); //can't do sub-millisecond sending with this code so just use 1ms timing
             break;
         case 1: //wait - do not send any more frames until other side says so

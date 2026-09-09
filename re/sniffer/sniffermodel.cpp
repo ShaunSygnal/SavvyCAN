@@ -12,7 +12,8 @@ SnifferModel::SnifferModel(QObject *parent)
       mFadeInactive(false),
       mMuteNotched(false),
       mTimeSequence(0),
-      mExpireInterval(5000)
+      mExpireInterval(5000),
+      mDataColumns(8)
 {
     QColor TextColor = QApplication::palette().color(QPalette::Text);
     if (TextColor.red() + TextColor.green() + TextColor.blue() < 200)
@@ -36,7 +37,8 @@ void SnifferModel::setExpireInterval(int newVal)
 
 int SnifferModel::columnCount(const QModelIndex &parent) const
 {
-    return parent.isValid() ? 0 : tc::LAST+1;
+    //fixed columns, then one column per data byte, then a trailing spacer column
+    return parent.isValid() ? 0 : tc::DATA_0 + mDataColumns + 1;
 }
 
 
@@ -73,7 +75,7 @@ QVariant SnifferModel::data(const QModelIndex &index, int role) const
                 default:
                     break;
             }
-            if(tc::DATA_0<=col && col <=tc::DATA_7)
+            if(tc::DATA_0<=col && col < tc::DATA_0 + mDataColumns)
             {
                 int data = item->getData(col-tc::DATA_0);
                 if(data >= 0)
@@ -111,7 +113,7 @@ QVariant SnifferModel::data(const QModelIndex &index, int role) const
                     return QBrush(QColor(128,0,0));
                 }
             }
-            else if(tc::DATA_0<=col && col<=tc::DATA_7)
+            else if(tc::DATA_0<=col && col < tc::DATA_0 + mDataColumns)
             {
                 dc change = item->dataChange(col-tc::DATA_0);
                 switch(change)
@@ -158,7 +160,7 @@ QVariant SnifferModel::headerData(int section, Qt::Orientation orientation, int 
             default:
                 break;
         }
-        if(tc::DATA_0<=section && section <=tc::DATA_7)
+        if(tc::DATA_0<=section && section < tc::DATA_0 + mDataColumns)
             return QString::number(section-tc::DATA_0);
     }
 
@@ -173,7 +175,7 @@ QModelIndex SnifferModel::index(int row, int column, const QModelIndex &parent) 
 
     const QMap<quint32, SnifferItem*>& map = mFilter ? mFilters : mMap;
 
-    if(column>tc::LAST || row>=map.size())
+    if(column>=columnCount() || row>=map.size())
         return QModelIndex();
 
     /* ugly but I can't find best without creating a list to keep indexes */
@@ -227,6 +229,7 @@ void SnifferModel::clear()
     mMap.clear();
     mFilters.clear();
     mFilter = false;
+    mDataColumns = 8;
     endResetModel();
 }
 
@@ -318,6 +321,15 @@ void SnifferModel::update(CANConnection*, QVector<CANFrame>& pFrames)
 {
     foreach(const CANFrame& frame, pFrames)
     {
+        //CAN-FD frames can carry more than 8 bytes. Grow the number of data columns to fit the longest frame seen.
+        int dataLen = qMin(frame.payload().length(), SNIFFER_MAX_DATA_BYTES);
+        if (dataLen > mDataColumns)
+        {
+            beginInsertColumns(QModelIndex(), tc::DATA_0 + mDataColumns, tc::DATA_0 + dataLen - 1);
+            mDataColumns = dataLen;
+            endInsertColumns();
+        }
+
         if(!mMap.contains(frame.frameId()))
         {
             int index = std::distance(mMap.begin(), mMap.lowerBound(frame.frameId()));

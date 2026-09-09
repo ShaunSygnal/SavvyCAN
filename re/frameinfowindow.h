@@ -35,7 +35,8 @@ private slots:
 
 private:
     Ui::FrameInfoWindow *ui;
-    QCustomPlot *graphByte[8];
+    QVector<QCustomPlot *> graphByte; //one plot per data byte, created on demand (up to 64 for CAN-FD)
+    int byteGraphsShown;
     QCustomPlot *graphHistogram;
     CANDataGrid *heatmap;
 
@@ -48,12 +49,12 @@ private:
     static QPen bytePens[8];
     DBCHandler *dbcHandler;
 
-    QCPGraph *graphRef[8];
 
     void refreshIDList();
     void closeEvent(QCloseEvent *event);
     bool eventFilter(QObject *obj, QEvent *event);
     void setupByteGraph(QCustomPlot *plot, int num);
+    void ensureByteGraphs(int count);
     void readSettings();
     void writeSettings();
     void dumpNode(QTreeWidgetItem* item, QFile *file, int indent);

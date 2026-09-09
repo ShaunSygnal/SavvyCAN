@@ -37,12 +37,8 @@ FrameInfoWindow::FrameInfoWindow(const QVector<CANFrame> *frames, QWidget *paren
     ui->splitter->setStretchFactor(0, 1); //idx, stretch factor
     ui->splitter->setStretchFactor(1, 4); //goal is to make right hand side larger by default
 
-    for (int i = 0; i < 8; i++)
-    {
-        graphByte[i] = new QCustomPlot();
-        setupByteGraph(graphByte[i], i);
-        ui->gridLower->addWidget(graphByte[i], i / 4, i & 3);
-    }
+    byteGraphsShown = 0;
+    ensureByteGraphs(8); //classic CAN default. Grows automatically when CAN-FD frames show up
 
     ui->gridUpper->addWidget(new QLabel("Heatmap"), 0, 0);
     heatmap = new CANDataGrid();
@@ -167,6 +163,33 @@ void FrameInfoWindow::setupByteGraph(QCustomPlot *plot, int num)
     connect(plot, &QCustomPlot::mouseDoubleClick, this, &FrameInfoWindow::mouseDoubleClick);
 }
 
+//Make sure we have (and are showing) one byte plot per data byte. Classic CAN frames need 8 plots in a
+//2x4 grid. CAN-FD frames can need up to 64 so those get laid out 8 per row. Plots are created once and reused.
+void FrameInfoWindow::ensureByteGraphs(int count)
+{
+    count = qBound(1, count, 64);
+    while (graphByte.count() < count)
+    {
+        QCustomPlot *plot = new QCustomPlot();
+        setupByteGraph(plot, graphByte.count());
+        graphByte.append(plot);
+    }
+    if (count == byteGraphsShown) return;
+
+    int columns = (count > 8) ? 8 : 4;
+    for (int i = 0; i < graphByte.count(); i++)
+    {
+        ui->gridLower->removeWidget(graphByte[i]);
+        if (i < count)
+        {
+            ui->gridLower->addWidget(graphByte[i], i / columns, i % columns);
+            graphByte[i]->setVisible(true);
+        }
+        else graphByte[i]->setVisible(false);
+    }
+    byteGraphsShown = count;
+}
+
 void FrameInfoWindow::mousePress()
 {
     QCustomPlot *plot = qobject_cast<QCustomPlot *>(sender());
@@ -206,24 +229,24 @@ void FrameInfoWindow::mouseDoubleClick()
     QCustomPlot *plot = qobject_cast<QCustomPlot *>(sender());
     bool hideMode = true;
 
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < byteGraphsShown; i++)
     {
-        if (ui->gridLower->itemAt(i)->widget()->isHidden()) hideMode = false;
+        if (graphByte[i]->isHidden()) hideMode = false;
     }
 
     if (hideMode)
     {
-    for (int i = 0; i < 8; i++)
+        for (int i = 0; i < byteGraphsShown; i++)
         {
-            if (ui->gridLower->itemAt(i)->widget() == (plot)) qDebug() << "Idx " << i << " matched!";
-            else ui->gridLower->itemAt(i)->widget()->setHidden(true);
+            if (graphByte[i] == plot) qDebug() << "Idx " << i << " matched!";
+            else graphByte[i]->setHidden(true);
         }
     }
     else
     {
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < byteGraphsShown; i++)
         {
-            ui->gridLower->itemAt(i)->widget()->setHidden(false);
+            graphByte[i]->setHidden(false);
         }
     }
 }
@@ -376,22 +399,26 @@ void FrameInfoWindow::updateDetailsWindow(QString newID)
     int64_t minInterval;
     int64_t maxInterval;
     int64_t thisInterval;
-    int minData[8];
-    int maxData[8];
-    int dataHistogram[256][8];
-    int bitfieldHistogram[64];
+    //sized for the CAN-FD maximum of 64 data bytes (512 bits). Classic CAN frames simply use the first 8 entries.
+    const int maxBytes = 64;
+    const int maxBits = maxBytes * 8;
+    int minData[maxBytes];
+    int maxData[maxBytes];
+    QVector<int> dataHistogram(256 * maxBytes, 0); //indexed as [value * maxBytes + byte]
+    int bitfieldHistogram[maxBits];
     QVector<double> histGraphX, histGraphY;
-    QVector<double> byteGraphX, byteGraphY[8];
+    QVector<double> byteGraphX;
+    QVector<QVector<double>> byteGraphY(maxBytes);
     QVector<double> timeGraphX, timeGraphY;
     QHash<QString, QHash<QString, int>> signalInstances;
     double maxY = -1000.0;
-    uint8_t changedBits[8];
-    uint8_t referenceBits[8];
-    uint8_t heatVals[512];
+    uint8_t changedBits[maxBytes];
+    uint8_t referenceBits[maxBytes];
+    uint8_t heatVals[maxBits];
 
     //these two used by bitflip heatmap functionality
-    uint8_t refByte[8];
-    double bitFlipHeat[64];
+    uint8_t refByte[maxBytes];
+    double bitFlipHeat[maxBits];
 
     QTreeWidgetItem *baseNode, *dataBase, *histBase, *tempItem;
 
@@ -416,7 +443,7 @@ void FrameInfoWindow::updateDetailsWindow(QString newID)
         if (frameCache.count() == 0) return; //nothing to do if there are no frames!
 
         const unsigned char *data = reinterpret_cast<const unsigned char *>(frameCache.at(0).payload().constData());
-        int dataLen = frameCache.at(0).payload().length();
+        int dataLen = qMin(frameCache.at(0).payload().length(), maxBytes);
 
         ui->treeDetails->clear();
 
@@ -511,17 +538,16 @@ void FrameInfoWindow::updateDetailsWindow(QString newID)
         baseNode->addChild(tempItem);
 
         //clear out all the counters and accumulators
-        minLen = 8;
+        minLen = maxBytes;
         maxLen = 0;
         minInterval = 0x7FFFFFFF;
         maxInterval = 0;
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < maxBytes; i++)
         {
             minData[i] = 256;
             maxData[i] = -1;
-            for (int k = 0; k < 256; k++) dataHistogram[k][i] = 0;
         }
-        for (int j = 0; j < 64; j++)
+        for (int j = 0; j < maxBits; j++)
         {
             bitfieldHistogram[j] = 0;
             bitFlipHeat[j] = 0;
@@ -529,7 +555,7 @@ void FrameInfoWindow::updateDetailsWindow(QString newID)
         signalInstances.clear();
 
         data = reinterpret_cast<const unsigned char *>(frameCache.at(0).payload().constData());
-        dataLen = frameCache.at(0).payload().length();
+        dataLen = qMin(frameCache.at(0).payload().length(), maxBytes);
 
         for (int c = 0; c < dataLen; c++)
         {
@@ -548,7 +574,7 @@ void FrameInfoWindow::updateDetailsWindow(QString newID)
         for (int j = 0; j < frameCache.count(); j++)
         {
             data = reinterpret_cast<const unsigned char *>(frameCache.at(j).payload().constData());
-            dataLen = frameCache.at(j).payload().length();
+            dataLen = qMin(frameCache.at(j).payload().length(), maxBytes);
 
             byteGraphX.append(j);
             for (int bytcnt = 0; bytcnt < dataLen; bytcnt++)
@@ -579,7 +605,7 @@ void FrameInfoWindow::updateDetailsWindow(QString newID)
                 unsigned char dat = data[c];
                 if (minData[c] > dat) minData[c] = dat;
                 if (maxData[c] < dat) maxData[c] = dat;
-                dataHistogram[dat][c]++; //add one to count for this
+                dataHistogram[dat * maxBytes + c]++; //add one to count for this
                 for (int l = 0; l < 8; l++)
                 {
                     int bit = dat & (1 << l);
@@ -625,7 +651,7 @@ void FrameInfoWindow::updateDetailsWindow(QString newID)
         }
 
         //Divide all the bit flip heat values by the number of frames to get a ratio
-        for (int j = 0; j < 64; j++) bitFlipHeat[j] /= (double)frameCache.count();
+        for (int j = 0; j < maxBits; j++) bitFlipHeat[j] /= (double)frameCache.count();
 
         std::sort(sortedIntervals.begin(), sortedIntervals.end());
         int64_t intervalStdDiv = 0, intervalPctl5 = 0, intervalPctl95 = 0, intervalMean = 0, intervalVariance = 0;
@@ -725,10 +751,10 @@ void FrameInfoWindow::updateDetailsWindow(QString newID)
 
             for (int d = 0; d < 256; d++)
             {
-                if (dataHistogram[d][c] > 0)
+                if (dataHistogram[d * maxBytes + c] > 0)
                 {
                     tempItem = new QTreeWidgetItem();
-                    tempItem->setText(0, QString::number(d) + "/0x" + QString::number(d, 16) +" (" + Utility::formatByteAsBinary(static_cast<uint8_t>(d)) +") -> " + QString::number(dataHistogram[d][c]));
+                    tempItem->setText(0, QString::number(d) + "/0x" + QString::number(d, 16) +" (" + Utility::formatByteAsBinary(static_cast<uint8_t>(d)) +") -> " + QString::number(dataHistogram[d * maxBytes + c]));
                     histBase->addChild(tempItem);
                 }
             }
@@ -752,7 +778,7 @@ void FrameInfoWindow::updateDetailsWindow(QString newID)
         //heat map output
         dataBase = new QTreeWidgetItem();
         dataBase->setText(0, tr("Bitchange Heatmap"));
-        memset(heatVals, 0, 512); //always clear the array before populating it.
+        memset(heatVals, 0, sizeof(heatVals)); //always clear the array before populating it.
         for (int c = 0; c < 8 * maxLen; c++)
         {
             tempItem = new QTreeWidgetItem();
@@ -769,6 +795,7 @@ void FrameInfoWindow::updateDetailsWindow(QString newID)
             heatVals[c] = heat;
         }
         baseNode->addChild(dataBase);
+        heatmap->setBytesToDraw(maxLen); //grid grows to show every byte of a CAN-FD frame
         heatmap->setHeat(heatVals);
 
         QHash<QString, QHash<QString, int>>::const_iterator it = signalInstances.constBegin();
@@ -789,6 +816,7 @@ void FrameInfoWindow::updateDetailsWindow(QString newID)
 
         ui->treeDetails->insertTopLevelItem(0, baseNode);
 
+        graphHistogram->xAxis->setRange(0, qMax(8 * maxLen - 1, 1));
         graphHistogram->clearGraphs();
         graphHistogram->addGraph();
         graphHistogram->graph()->setData(histGraphX, histGraphY);
@@ -803,12 +831,14 @@ void FrameInfoWindow::updateDetailsWindow(QString newID)
         graphHistogram->axisRect()->setupFullAxesBox();
         graphHistogram->replot();
 
-        for (int graphs = 0; graphs < 8; graphs++)
+        ensureByteGraphs(qMax(maxLen, 1));
+        for (int graphs = 0; graphs < graphByte.count(); graphs++)
         {
             graphByte[graphs]->clearGraphs();
-            graphRef[graphs] = graphByte[graphs]->addGraph();
+            if (graphs >= maxLen) continue; //plot left over from a longer frame, hidden right now
+            graphByte[graphs]->addGraph();
             graphByte[graphs]->graph()->setData(byteGraphX, byteGraphY[graphs]);
-            graphByte[graphs]->graph()->setPen(bytePens[graphs]);
+            graphByte[graphs]->graph()->setPen(bytePens[graphs % 8]);
             graphByte[graphs]->xAxis->setRange(0, byteGraphX.count());
             graphByte[graphs]->replot();
         }

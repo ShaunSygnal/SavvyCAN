@@ -63,8 +63,8 @@ private:
     bool secondsMode;
     bool openGLMode;
     bool useHexTicker;
-    QVector<double> x[8], y[8];
-    QCPGraph *graphRef[8];
+    QVector<double> x[64], y[64]; //one graph per data byte, CAN-FD frames carry up to 64 bytes
+    QCPGraph *graphRef[64];
 
     void refreshIDList();
     void updateFrameLabel();
