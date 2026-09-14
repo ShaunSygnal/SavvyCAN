@@ -1,5 +1,9 @@
 #Build directory
 build/
+build-appimage/
+
+# Packaged AppImage output
+*.AppImage
 
 # Compiled Object files
 *.slo
