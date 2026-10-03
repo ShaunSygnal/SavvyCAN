@@ -2,7 +2,8 @@
 #
 # Builds the real SavvyCAN sources (minus main.cpp) together with fdtest_main.cpp under
 # AddressSanitizer/UndefinedBehaviorSanitizer, then opens each tool window with frames of
-# 8..64 bytes and checks a few observable results. Exit code = number of failed checks.
+# 8..64 bytes and checks a few observable results. It also checks multiplexed-signal decoding in
+# Overwrite Mode through a standalone CANFrameModel. Exit code = number of failed checks.
 #
 #   mkdir build-fdtest && cd build-fdtest
 #   qmake ../test/fdtest/fdtest.pro && make -j$(nproc)

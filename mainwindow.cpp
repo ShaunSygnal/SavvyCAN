@@ -1896,6 +1896,7 @@ void MainWindow::showFlowViewWindow()
 void MainWindow::DBCSettingsUpdated()
     {
     updateFilterList();
+    model->invalidateMuxSections(); //DBC files changed so per-section decoding data must be rebuilt
     model->sendRefresh();
     }
 

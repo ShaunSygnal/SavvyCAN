@@ -6,6 +6,8 @@
 #include <QVector>
 #include <QDebug>
 #include <QMutex>
+#include <QHash>
+#include <QByteArray>
 #include "can_structs.h"
 #include "dbc/dbchandler.h"
 #include "connections/canconnection.h"
@@ -60,6 +62,7 @@ public:
     void saveFilterFile(QString filename);
     void normalizeTiming();
     void recalcOverwrite();
+    void invalidateMuxSections(); //call when the loaded DBC files change so the per-section frame cache is rebuilt
     bool needsFilterRefresh();
     void insertFrames(const QVector<CANFrame> &newFrames);
     void sortByColumn(int column);
@@ -82,6 +85,17 @@ private:
     uint64_t getCANFrameVal(QVector<CANFrame> *frames, int row, Column col);
     bool any_filters_are_configured(void);
     bool any_busfilters_are_configured(void);
+
+    //Overwrite mode keeps only the newest frame per ID. For multiplexed messages the other sections would be lost,
+    //so we also remember the newest frame for every distinct combination of active multiplexor values, per ID+bus.
+    QHash<uint64_t, QHash<QByteArray, CANFrame>> muxSectionFrames;
+    bool muxSectionsDirty; //cache needs a rebuild from 'frames' before it can be trusted
+    static uint64_t muxKey(const CANFrame &frame);
+    static QByteArray muxSignature(DBC_MESSAGE *msg, const CANFrame &frame);
+    void storeMuxSection(const CANFrame &frame, DBC_MESSAGE *msg);
+    void updateMuxSection(const CANFrame &frame);
+    void rebuildMuxSections();
+    QString olderSectionText(DBC_SIGNAL *sig, const CANFrame &latest) const;
 
     QVector<CANFrame> frames;
     QVector<CANFrame> filteredFrames;

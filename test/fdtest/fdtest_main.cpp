@@ -9,6 +9,8 @@
 #include <QMetaObject>
 #include <QDebug>
 #include <QDir>
+#include <QElapsedTimer>
+#include <QFile>
 #include <cstdio>
 
 // Test-only hack so the harness can poke private members of the windows under test.
@@ -365,6 +367,151 @@ int main(int argc, char *argv[])
             pump(50);
             delete w;
         }
+    }
+
+    SECTION("Multiplexed overwrite decoding");
+    {
+        // Message 0x321: MuxSel (byte 0) selects TempA (mux 0) or SpeedB (mux 1) in byte 1; Always is byte 2.
+        QString dbcPath = QCoreApplication::applicationDirPath() + "/fd_mux_test.dbc";
+        QFile dbcFile(dbcPath);
+        dbcFile.open(QIODevice::WriteOnly | QIODevice::Truncate);
+        dbcFile.write("VERSION \"\"\n\nNS_ :\n\nBS_:\n\nBU_: ECU\n\n"
+                      "BO_ 801 MuxMsg: 8 ECU\n"
+                      " SG_ MuxSel M : 0|8@1+ (1,0) [0|255] \"\" Vector__XXX\n"
+                      " SG_ TempA m0 : 8|8@1+ (1,0) [0|255] \"C\" Vector__XXX\n"
+                      " SG_ SpeedB m1 : 8|8@1+ (1,0) [0|255] \"kph\" Vector__XXX\n"
+                      " SG_ Always : 16|8@1+ (1,0) [0|255] \"\" Vector__XXX\n");
+        dbcFile.close();
+        DBCHandler *dbc = DBCHandler::getReference();
+        dbc->removeAllFiles();
+        dbc->loadDBCFile(dbcPath);
+        CHECK(dbc->findMessage(801) != nullptr, "test DBC loaded (message 0x321 found)");
+
+        QSettings().setValue("Main/MaximumFrames", 300000); // keep the model's preallocation small for ASan
+
+        auto muxFrame = [](int bus, int mux, int value, uint64_t micros)
+        {
+            QByteArray p(8, 0);
+            p[0] = static_cast<char>(mux);
+            p[1] = static_cast<char>(value);
+            p[2] = 7;
+            CANFrame f = mkFrame(0x321, p, micros);
+            f.bus = bus;
+            return f;
+        };
+        // Decoded text of the Data column for the row with this ID and bus
+        auto rowText = [](CANFrameModel &m, uint32_t id, int bus) -> QString
+        {
+            const QVector<CANFrame> *rows = m.getFilteredListReference();
+            for (int i = 0; i < rows->count(); i++)
+                if (rows->at(i).frameId() == id && rows->at(i).bus == bus)
+                    return m.data(m.index(i, static_cast<int>(Column::Data)), Qt::DisplayRole).toString();
+            return QString("<no row>");
+        };
+        auto lineWith = [](const QString &text, const QString &prefix) -> QString
+        {
+            for (const QString &l : text.split('\n')) if (l.trimmed().startsWith(prefix)) return l.trimmed();
+            return QString();
+        };
+        auto countOf = [](const QString &text, const QString &needle) { return text.count(needle); };
+
+        CANFrameModel m;
+        m.setOverwriteMode(true);
+        m.setInterpretMode(true);
+
+        // (a) section 0 arrives first, section 1 is the newest frame
+        m.addFrame(muxFrame(0, 0, 42, 1000), false);
+        m.addFrame(muxFrame(0, 1, 77, 2000), false);
+        m.sendRefresh();
+        QString t = rowText(m, 0x321, 0);
+        fprintf(stderr, "  (a) text:\n%s\n", t.toUtf8().constData());
+        CHECK(!t.contains("kphTempA") && !t.contains("kphSpeedB") && !t.contains("CSpeedB"), "(a) every signal is on its own line");
+        CHECK(countOf(t, "SpeedB:") == 1, "(a) newest section SpeedB printed exactly once (got %d)", countOf(t, "SpeedB:"));
+        CHECK(lineWith(t, "SpeedB:").startsWith("SpeedB: 77") && !lineWith(t, "SpeedB:").contains("ms old"), "(a) SpeedB: 77 has no age marker (got '%s')", lineWith(t, "SpeedB:").toUtf8().constData());
+        CHECK(lineWith(t, "TempA:").startsWith("TempA: 42") && lineWith(t, "TempA:").contains("ms old]"), "(a) older section TempA: 42 shown with an age marker (got '%s')", lineWith(t, "TempA:").toUtf8().constData());
+        CHECK(lineWith(t, "TempA:").contains("1.0 ms old]"), "(a) TempA age is 1.0 ms (got '%s')", lineWith(t, "TempA:").toUtf8().constData());
+        CHECK(countOf(t, "Always:") == 1, "(a) non-multiplexed Always printed once (got %d)", countOf(t, "Always:"));
+
+        // (b) a newer section 0 frame replaces the old one, then section 1 again
+        m.addFrame(muxFrame(0, 0, 43, 3000), false);
+        m.addFrame(muxFrame(0, 1, 78, 4000), false);
+        m.sendRefresh();
+        t = rowText(m, 0x321, 0);
+        CHECK(lineWith(t, "TempA:").startsWith("TempA: 43"), "(b) TempA shows the newer section frame (got '%s')", lineWith(t, "TempA:").toUtf8().constData());
+        CHECK(lineWith(t, "SpeedB:").startsWith("SpeedB: 78"), "(b) SpeedB shows 78 (got '%s')", lineWith(t, "SpeedB:").toUtf8().constData());
+
+        // (b2) when the newest frame is section 0, the old section 1 value is shown with its age
+        m.addFrame(muxFrame(0, 0, 44, 6000), false);
+        m.sendRefresh();
+        t = rowText(m, 0x321, 0);
+        CHECK(countOf(t, "TempA:") == 1 && !lineWith(t, "TempA:").contains("ms old"), "(b2) newest section TempA printed once without age (got %d)", countOf(t, "TempA:"));
+        CHECK(lineWith(t, "SpeedB:").startsWith("SpeedB: 78") && lineWith(t, "SpeedB:").contains("2.0 ms old]"), "(b2) SpeedB: 78 kept from its own frame, 2.0 ms older (got '%s')", lineWith(t, "SpeedB:").toUtf8().constData());
+
+        // (c) same ID on bus 1 with only section 1 must not inherit bus 0's TempA
+        m.addFrame(muxFrame(1, 1, 99, 7000), false);
+        m.sendRefresh();
+        QString t1 = rowText(m, 0x321, 1);
+        CHECK(lineWith(t1, "SpeedB:").startsWith("SpeedB: 99"), "(c) bus 1 shows its own SpeedB (got '%s')", lineWith(t1, "SpeedB:").toUtf8().constData());
+        CHECK(!t1.contains("TempA:"), "(c) bus 1 has no TempA text at all (got '%s')", t1.simplified().toUtf8().constData());
+
+        // (e) a section that never arrived is omitted rather than shown as 0
+        CANFrameModel fresh;
+        fresh.setOverwriteMode(true);
+        fresh.setInterpretMode(true);
+        fresh.addFrame(muxFrame(0, 1, 55, 1000), false);
+        fresh.sendRefresh();
+        QString tf = rowText(fresh, 0x321, 0);
+        CHECK(!tf.contains("TempA:"), "(e) never-received section TempA is omitted (got '%s')", tf.simplified().toUtf8().constData());
+
+        // (f) an RTR frame with the same ID must not replace a cached section
+        CANFrame rtr = mkFrame(0x321, QByteArray(), 9000);
+        rtr.setFrameType(QCanBusFrame::RemoteRequestFrame);
+        m.addFrame(muxFrame(0, 1, 80, 8000), false);
+        m.addFrame(rtr, false);
+        m.addFrame(muxFrame(0, 0, 45, 10000), false); // a later section 0 frame; section 1 must still come from the t=8000 frame
+        m.sendRefresh();
+        t = rowText(m, 0x321, 0);
+        CHECK(lineWith(t, "SpeedB:").startsWith("SpeedB: 80") && lineWith(t, "SpeedB:").contains("2.0 ms old]"), "(f) RTR frame did not clobber SpeedB (got '%s')", lineWith(t, "SpeedB:").toUtf8().constData());
+
+        // (d) frames received while Interpret was off are decoded per section once it is switched on
+        CANFrameModel late;
+        late.setOverwriteMode(true);
+        late.addFrame(muxFrame(0, 0, 11, 1000), false);
+        late.addFrame(muxFrame(0, 1, 22, 2000), false);
+        late.sendRefresh();
+        late.setInterpretMode(true);
+        QString tl = rowText(late, 0x321, 0);
+        CHECK(lineWith(tl, "TempA:").startsWith("TempA: 11") && lineWith(tl, "SpeedB:").startsWith("SpeedB: 22"), "(d) sections decoded after enabling Interpret (TempA '%s', SpeedB '%s')", lineWith(tl, "TempA:").toUtf8().constData(), lineWith(tl, "SpeedB:").toUtf8().constData());
+
+        // (d2) DBC reload: the cache is invalidated and rebuilt from history, and values stay attached to their own sections
+        dbc->removeAllFiles();
+        dbc->loadDBCFile(dbcPath);
+        late.invalidateMuxSections();
+        late.sendRefresh();
+        tl = rowText(late, 0x321, 0);
+        CHECK(lineWith(tl, "TempA:").startsWith("TempA: 11") && lineWith(tl, "SpeedB:").startsWith("SpeedB: 22"), "(d2) sections intact after DBC reload (TempA '%s', SpeedB '%s')", lineWith(tl, "TempA:").toUtf8().constData(), lineWith(tl, "SpeedB:").toUtf8().constData());
+
+        // (g) 200k frames of history: enabling Interpret (rebuild) and toggling an unrelated filter must both stay quick
+        CANFrameModel big;
+        big.setOverwriteMode(true);
+        for (int i = 0; i < 200000; i++)
+        {
+            big.addFrame(muxFrame(0, i % 8, i & 0xFF, 10000 + i), false);
+            if ((i % 4) == 0) big.addFrame(mkFrame(0x700 + (i % 16), seq(8, i), 10000 + i), false);
+        }
+        QElapsedTimer timer;
+        timer.start();
+        big.setInterpretMode(true);
+        qint64 rebuildMs = timer.elapsed();
+        timer.restart();
+        big.setFilterState(0x700, false);
+        qint64 toggleMs = timer.elapsed();
+        fprintf(stderr, "  (g) enable Interpret over 250k frames: %lld ms, unrelated filter toggle: %lld ms\n", (long long)rebuildMs, (long long)toggleMs);
+        CHECK(rebuildMs < 10000, "(g) enabling Interpret over 250k frames took %lld ms (< 10000)", (long long)rebuildMs);
+        CHECK(toggleMs < 2000, "(g) filter toggle took %lld ms (< 2000)", (long long)toggleMs);
+
+        dbc->removeAllFiles(); // the DBC handler is a process-wide singleton, leave it clean
+        QFile::remove(dbcPath);
     }
 
     SECTION("DONE");

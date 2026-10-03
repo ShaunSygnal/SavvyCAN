@@ -87,6 +87,7 @@ CANFrameModel::CANFrameModel(QObject *parent)
     timeFormat =  "MMM-dd HH:mm:ss.zzz";
     sortDirAsc = false;
     bytesPerLine = 8;
+    muxSectionsDirty = false;
 }
 
 void CANFrameModel::setBytesPerLine(int bpl)
@@ -134,6 +135,14 @@ void CANFrameModel::setInterpretMode(bool mode)
     {
         this->beginResetModel();
         interpretFrames = mode;
+        mutex.lock();
+        if (mode)
+        {
+            muxSectionsDirty = true;
+            if (overwriteDups) rebuildMuxSections();
+        }
+        else muxSectionFrames.clear();
+        mutex.unlock();
         this->endResetModel();
     }
 }
@@ -205,6 +214,10 @@ void CANFrameModel::setOverwriteMode(bool mode)
 {
     beginResetModel();
     overwriteDups = mode;
+    mutex.lock();
+    muxSectionsDirty = true;
+    if (!mode) muxSectionFrames.clear();
+    mutex.unlock(); //recalcOverwrite takes the mutex itself
     recalcOverwrite();
     endResetModel();
 }
@@ -356,6 +369,95 @@ void CANFrameModel::sortByColumn(int column)
 
 //End of custom sorting code
 
+//Tell the model the DBC files changed. The section cache is rebuilt from the frame history on the next recalcOverwrite
+//(which sendRefresh triggers). Deliberately not rebuilt on every recalcOverwrite since that also runs on each filter toggle.
+void CANFrameModel::invalidateMuxSections()
+{
+    mutex.lock();
+    muxSectionsDirty = true;
+    mutex.unlock();
+}
+
+uint64_t CANFrameModel::muxKey(const CANFrame &frame)
+{
+    return static_cast<uint64_t>(frame.frameId()) + (static_cast<uint64_t>(frame.bus) << 29ull); //same augmented id recalcOverwrite uses
+}
+
+//Which section of a multiplexed message a frame belongs to: the values of the multiplexors that are actually active in
+//that frame (inactive nested multiplexors have undefined bits and must not split one real section into several)
+QByteArray CANFrameModel::muxSignature(DBC_MESSAGE *msg, const CANFrame &frame)
+{
+    QByteArray signature;
+    for (int j = 0; j < msg->sigHandler->getCount(); j++)
+    {
+        DBC_SIGNAL *sig = msg->sigHandler->findSignalByIdx(j);
+        int32_t val;
+        if (sig && sig->isMultiplexor && sig->isSignalInMessage(frame) && sig->processAsInt(frame, val))
+        {
+            signature.append(QByteArray::number(val));
+            signature.append(',');
+        }
+    }
+    return signature;
+}
+
+void CANFrameModel::storeMuxSection(const CANFrame &frame, DBC_MESSAGE *msg)
+{
+    if (!msg || !msg->multiplexorSignal) return;
+    QHash<QByteArray, CANFrame> &sections = muxSectionFrames[muxKey(frame)];
+    QByteArray signature = muxSignature(msg, frame);
+    //SHORTCUT: sections beyond this many per ID are not tracked. Raise it if a wide (e.g. 16 bit) multiplexor is ever used.
+    if (sections.count() >= 256 && !sections.contains(signature)) return;
+    sections[signature] = frame;
+}
+
+void CANFrameModel::updateMuxSection(const CANFrame &frame)
+{
+    if (frame.frameType() != QCanBusFrame::DataFrame) return; //RTR and error frames carry no signal data
+    if (dbcHandler == nullptr) return;
+    storeMuxSection(frame, dbcHandler->findMessage(frame));
+}
+
+//Rebuild the whole cache from the frame history. Caller holds the mutex. Ignores ID/bus filters so that
+//enabling a filter later still shows the sections.
+void CANFrameModel::rebuildMuxSections()
+{
+    muxSectionFrames.clear();
+    muxSectionsDirty = false;
+    if (dbcHandler == nullptr) return;
+
+    QHash<uint64_t, DBC_MESSAGE *> messageForId; //one DBC lookup per ID+bus instead of one per frame
+    for (const CANFrame &frame : qAsConst(frames))
+    {
+        if (frame.frameType() != QCanBusFrame::DataFrame) continue;
+        uint64_t key = muxKey(frame);
+        auto it = messageForId.constFind(key);
+        if (it == messageForId.constEnd()) it = messageForId.insert(key, dbcHandler->findMessage(frame));
+        if (it.value()) storeMuxSection(frame, it.value());
+    }
+}
+
+//Decode a multiplexed signal that is not part of the latest frame from the newest frame that did carry it
+QString CANFrameModel::olderSectionText(DBC_SIGNAL *sig, const CANFrame &latest) const
+{
+    auto it = muxSectionFrames.constFind(muxKey(latest));
+    if (it == muxSectionFrames.constEnd()) return QString();
+
+    const CANFrame *best = nullptr;
+    for (const CANFrame &candidate : it.value())
+    {
+        if (!sig->isSignalInMessage(candidate)) continue;
+        if (!best || candidate.timeStamp().microSeconds() > best->timeStamp().microSeconds()) best = &candidate;
+    }
+    if (!best) return QString();
+
+    QString text;
+    if (!sig->processAsText(*best, text)) return QString();
+    qint64 ageMicros = latest.timeStamp().microSeconds() - best->timeStamp().microSeconds();
+    if (ageMicros < 0) ageMicros = 0;
+    return text + QString("  [%1 ms old]").arg(ageMicros / 1000.0, 0, 'f', 1);
+}
+
 void CANFrameModel::recalcOverwrite()
 {
     if (!overwriteDups) return; //no need to do a thing if mode is disabled
@@ -363,6 +465,7 @@ void CANFrameModel::recalcOverwrite()
     qDebug() << "recalcOverwrite called in model";
 
     mutex.lock();
+    if (muxSectionsDirty && interpretFrames) rebuildMuxSections();
     beginResetModel();
 
     //Look at the current list of frames and turn it into just a list of unique IDs
@@ -585,15 +688,24 @@ QVariant CANFrameModel::data(const QModelIndex &index, int role) const
                             if (sig->isMultiplexor)
                             {
                                 qDebug() << "Multiplexor. Diving into the tree";
-                                tempString.append(sig->processSignalTree(thisFrame));
+                                QString treeString = sig->processSignalTree(thisFrame); //signals active in this very frame
+                                if (!treeString.isEmpty())
+                                {
+                                    tempString.append(treeString);
+                                    if (!treeString.endsWith('\n')) tempString.append("\n");
+                                }
                             }
                         }
-                        else if (sig->isMultiplexed && overwriteDups) //wasn't in this exact frame but is in the message. Use cached value
+                        else if (sig->isMultiplexed && overwriteDups && !sig->isSignalInMessage(thisFrame))
                         {
-                            bool isInteger = false;
-                            if (sig->valType == UNSIGNED_INT || sig->valType == SIGNED_INT) isInteger = true;
-                            tempString.append(sig->makePrettyOutput(sig->cachedValue.toDouble(), sig->cachedValue.toLongLong(), true, isInteger));
-                            tempString.append("\n");
+                            //Not carried by the newest frame. Overwrite mode only displays that one frame so show the signal
+                            //from the newest frame that did carry it, tagged with how much older that frame is.
+                            QString olderString = olderSectionText(sig, thisFrame);
+                            if (!olderString.isEmpty())
+                            {
+                                tempString.append(olderString);
+                                tempString.append("\n");
+                            }
                         }
                     }
                 }
@@ -751,6 +863,7 @@ void CANFrameModel::addFrame(const CANFrame& frame, bool autoRefresh = false)
             }
         }
         frames.append(tempFrame);
+        if (interpretFrames && !muxSectionsDirty) updateMuxSection(tempFrame); //a dirty cache gets rebuilt from 'frames' anyway
         if (!found)
         {
             //frames.append(tempFrame);
@@ -877,6 +990,7 @@ void CANFrameModel::clearFrames()
     this->beginResetModel();
     frames.clear();
     filteredFrames.clear();
+    muxSectionFrames.clear();
     if(filtersPersistDuringClear == false)
     {
         filters.clear();

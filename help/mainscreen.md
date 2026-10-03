@@ -58,6 +58,8 @@ this off for performance reasons (interpreting takes some extra processor power 
 
 *The "Overwrite Mode" checkbox is used to ensure that only the newest frame for each message ID is shown. That is, if 100 messages with ID 0x105 come in you
 will see only the newest one. This is generally used alongside "Interpret Frames" to interpret frames and always see the up-to-date information.
+For multiplexed messages each multiplex section is decoded from the newest frame that actually carried that section, so signals from older sections keep their own
+values. A signal that was not in the newest frame is tagged with how much older its frame is, for example "TempA: 42 C  [12.5 ms old]". A section that has not been received yet is not shown.
 
 *"Expand All Rows" will expand all the rows to show every signal in every message. This will take a **VERY** long time if there are many messages loaded. Because of this, you may receive a warning if the program determines that this will take an excessive amount of time to complete. You can make it work faster by filtering away any unneeded messages.
 
